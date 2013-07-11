@@ -23,6 +23,8 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.DialogInterface.OnDismissListener;
+import android.content.res.Resources;
+import android.content.res.TypedArray;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
@@ -52,6 +54,8 @@ import android.text.util.Rfc822Token;
 import android.text.util.Rfc822Tokenizer;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.util.TypedValue;
+import android.util.Patterns;
 import android.view.ActionMode;
 import android.view.ActionMode.Callback;
 import android.view.DragEvent;
@@ -64,13 +68,16 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.View.OnClickListener;
 import android.view.ViewParent;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
 import android.widget.AdapterView;
 import android.widget.AdapterView.OnItemClickListener;
+import android.widget.Button;
+import android.widget.Filterable;
 import android.widget.ListAdapter;
 import android.widget.ListPopupWindow;
 import android.widget.ListView;
 import android.widget.MultiAutoCompleteTextView;
-import android.widget.PopupWindow;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
@@ -81,7 +88,10 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * RecipientEditTextView is an auto complete text view for use with applications
@@ -90,9 +100,11 @@ import java.util.Set;
 public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         OnItemClickListener, Callback, RecipientAlternatesAdapter.OnCheckedItemChangedListener,
         GestureDetector.OnGestureListener, OnDismissListener, OnClickListener,
-        PopupWindow.OnDismissListener {
+        TextView.OnEditorActionListener {
 
     private static final char COMMIT_CHAR_COMMA = ',';
+
+    private static final char NAME_WRAPPER_CHAR = '"';
 
     private static final char COMMIT_CHAR_SEMICOLON = ';';
 
@@ -124,6 +136,8 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     private float mChipHeight;
 
     private float mChipFontSize;
+
+    private float mLineSpacingExtra;
 
     private int mChipPadding;
 
@@ -164,8 +178,6 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
 
     private Dialog mCopyDialog;
 
-    private int mCopyViewRes;
-
     private String mCopyAddress;
 
     /**
@@ -185,6 +197,15 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     private boolean mTriedGettingScrollView;
 
     private boolean mDragEnabled = false;
+
+    // This pattern comes from android.util.Patterns. It has been tweaked to handle a "1" before
+    // parens, so numbers such as "1 (425) 222-2342" match.
+    private static final Pattern PHONE_PATTERN
+        = Pattern.compile(                                  // sdd = space, dot, or dash
+                "(\\+[0-9]+[\\- \\.]*)?"                    // +<digits><sdd>*
+                + "(1?[ ]*\\([0-9]+\\)[\\- \\.]*)?"         // 1(<digits>)<sdd>*
+                + "([0-9][0-9\\- \\.][0-9\\- \\.]+[0-9])"); // <digit><digit|sdd>+<digit>
+
 
     private final Runnable mAddTextWatcher = new Runnable() {
         @Override
@@ -216,22 +237,26 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
 
     };
 
+    private int mMaxLines;
+
+    private static int sExcessTopPadding = -1;
+
+    private int mActionBarHeight;
+
     public RecipientEditTextView(Context context, AttributeSet attrs) {
         super(context, attrs);
+        setChipDimensions(context, attrs);
         if (sSelectedTextColor == -1) {
             sSelectedTextColor = context.getResources().getColor(android.R.color.white);
         }
         mAlternatesPopup = new ListPopupWindow(context);
-        mAlternatesPopup.setOnDismissListener(this);
         mAddressPopup = new ListPopupWindow(context);
-        mAddressPopup.setOnDismissListener(this);
         mCopyDialog = new Dialog(context);
         mAlternatesListener = new OnItemClickListener() {
             @Override
             public void onItemClick(AdapterView<?> adapterView,View view, int position,
                     long rowId) {
                 mAlternatesPopup.setOnItemClickListener(null);
-                setEnabled(true);
                 replaceChip(mSelectedChip, ((RecipientAlternatesAdapter) adapterView.getAdapter())
                         .getRecipientEntry(position));
                 Message delayed = Message.obtain(mHandler, DISMISS);
@@ -256,6 +281,41 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         mTextWatcher = new RecipientTextWatcher();
         addTextChangedListener(mTextWatcher);
         mGestureDetector = new GestureDetector(context, this);
+        setOnEditorActionListener(this);
+        mMaxLines = getLineCount();
+    }
+
+    @Override
+    public boolean onEditorAction(TextView view, int action, KeyEvent keyEvent) {
+        if (action == EditorInfo.IME_ACTION_DONE) {
+            if (commitDefault()) {
+                return true;
+            }
+            if (mSelectedChip != null) {
+                clearSelectedChip();
+                return true;
+            } else if (focusNext()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+        InputConnection connection = super.onCreateInputConnection(outAttrs);
+        int imeActions = outAttrs.imeOptions&EditorInfo.IME_MASK_ACTION;
+        if ((imeActions&EditorInfo.IME_ACTION_DONE) != 0) {
+            // clear the existing action
+            outAttrs.imeOptions ^= imeActions;
+            // set the DONE action
+            outAttrs.imeOptions |= EditorInfo.IME_ACTION_DONE;
+        }
+        if ((outAttrs.imeOptions&EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0) {
+            outAttrs.imeOptions &= ~EditorInfo.IME_FLAG_NO_ENTER_ACTION;
+        }
+        outAttrs.actionLabel = getContext().getString(R.string.done);
+        return connection;
     }
 
     /*package*/ RecipientChip getLastChip() {
@@ -309,15 +369,27 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         }
         super.append(text, start, end);
         if (!TextUtils.isEmpty(text) && TextUtils.getTrimmedLength(text) > 0) {
-            final String displayString = (String) text;
-            int seperatorPos = displayString.indexOf(COMMIT_CHAR_COMMA);
-            if (seperatorPos != 0 && !TextUtils.isEmpty(displayString)
+            String displayString = text.toString();
+            int separatorPos = displayString.lastIndexOf(COMMIT_CHAR_COMMA);
+            // Verify that the separator pos is not within ""; if it is, look
+            // past the closing quote. If there is no comma past ", this string
+            // will resolve to an error chip.
+            if (separatorPos > -1) {
+                String parseDisplayString = displayString.substring(separatorPos);
+                int endQuotedTextPos = parseDisplayString.indexOf(NAME_WRAPPER_CHAR);
+                if (endQuotedTextPos > separatorPos) {
+                    separatorPos = parseDisplayString.lastIndexOf(COMMIT_CHAR_COMMA,
+                            endQuotedTextPos);
+                }
+            }
+            if (!TextUtils.isEmpty(displayString)
                     && TextUtils.getTrimmedLength(displayString) > 0) {
                 mPendingChipsCount++;
-                mPendingChips.add((String)text);
+                mPendingChips.add(text.toString());
             }
         }
-        // Put a message on the queue to make sure we ALWAYS handle pending chips.
+        // Put a message on the queue to make sure we ALWAYS handle pending
+        // chips.
         if (mPendingChipsCount > 0) {
             postHandlePendingChips();
         }
@@ -334,14 +406,56 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         }
     }
 
+    private int getExcessTopPadding() {
+        if (sExcessTopPadding == -1) {
+            sExcessTopPadding = (int) (mChipHeight + mLineSpacingExtra);
+        }
+        return sExcessTopPadding;
+    }
+
+    public <T extends ListAdapter & Filterable> void setAdapter(T adapter) {
+        super.setAdapter(adapter);
+        ((BaseRecipientAdapter) adapter)
+                .registerUpdateObserver(new BaseRecipientAdapter.EntriesUpdatedObserver() {
+                    @Override
+                    public void onChanged(List<RecipientEntry> entries) {
+                        // Scroll the chips field to the top of the screen so
+                        // that the user can see as many results as possible.
+                        if (entries != null && entries.size() > 0) {
+                            scrollBottomIntoView();
+                        }
+                    }
+                });
+    }
+
+    private void scrollBottomIntoView() {
+        if (mScrollView != null && mShouldShrink) {
+            int[] location = new int[2];
+            getLocationOnScreen(location);
+            int height = getHeight();
+            int currentPos = location[1] + height;
+            // Desired position shows at least 1 line of chips below the action
+            // bar. We add excess padding to make sure this is always below other
+            // content.
+            int desiredPos = (int) mChipHeight + mActionBarHeight + getExcessTopPadding();
+            if (currentPos > desiredPos) {
+                mScrollView.scrollBy(0, currentPos - desiredPos);
+            }
+        }
+    }
+
     @Override
     public void performValidation() {
         // Do nothing. Chips handles its own validation.
     }
 
     private void shrink() {
-        if (mSelectedChip != null
-                && mSelectedChip.getEntry().getContactId() != RecipientEntry.INVALID_CONTACT) {
+        if (mTokenizer == null) {
+            return;
+        }
+        long contactId = mSelectedChip != null ? mSelectedChip.getEntry().getContactId() : -1;
+        if (mSelectedChip != null && contactId != RecipientEntry.INVALID_CONTACT
+                && (!isPhoneQuery() && contactId != RecipientEntry.GENERATED_CONTACT)) {
             clearSelectedChip();
         } else {
             if (getWidth() <= 0) {
@@ -368,7 +482,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                     int whatEnd = mTokenizer.findTokenEnd(text, start);
                     // This token was already tokenized, so skip past the ending token.
                     if (whatEnd < text.length() && text.charAt(whatEnd) == ',') {
-                        whatEnd++;
+                        whatEnd = movePastTerminators(whatEnd);
                     }
                     // In the middle of chip; treat this as an edit
                     // and commit the whole token.
@@ -386,6 +500,9 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     }
 
     private void expand() {
+        if (mShouldShrink) {
+            setMaxLines(Integer.MAX_VALUE);
+        }
         removeMoreChip();
         setCursorVisible(true);
         Editable text = getText();
@@ -449,7 +566,8 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     }
 
 
-    private Bitmap createUnselectedChip(RecipientEntry contact, TextPaint paint, Layout layout) {
+    private Bitmap createUnselectedChip(RecipientEntry contact, TextPaint paint, Layout layout,
+            boolean leaveBlankIconSpacer) {
         // Ellipsize the text so that it takes AT MOST the entire width of the
         // autocomplete text entry area. Make sure to leave space for padding
         // on the sides.
@@ -473,8 +591,14 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             background.setBounds(0, 0, width, height);
             background.draw(canvas);
 
-            // Don't draw photos for recipients that have been typed in.
-            if (contact.getContactId() != RecipientEntry.INVALID_CONTACT) {
+            // Don't draw photos for recipients that have been typed in OR generated on the fly.
+            long contactId = contact.getContactId();
+            boolean drawPhotos = isPhoneQuery() ?
+                    contactId != RecipientEntry.INVALID_CONTACT
+                    : (contactId != RecipientEntry.INVALID_CONTACT
+                            && (contactId != RecipientEntry.GENERATED_CONTACT &&
+                                    !TextUtils.isEmpty(contact.getDisplayName())));
+            if (drawPhotos) {
                 byte[] photoBytes = contact.getPhotoBytes();
                 // There may not be a photo yet if anything but the first contact address
                 // was selected.
@@ -505,8 +629,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                     matrix.setRectToRect(src, dst, Matrix.ScaleToFit.FILL);
                     canvas.drawBitmap(photo, matrix, paint);
                 }
-            } else {
-                // Don't leave any space for the icon. It isn't being drawn.
+            } else if (!leaveBlankIconSpacer || isPhoneQuery()) {
                 iconWidth = 0;
             }
             paint.setColor(getContext().getResources().getColor(android.R.color.black));
@@ -531,12 +654,12 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     private float getTextYOffset(String text, TextPaint paint, int height) {
         Rect bounds = new Rect();
         paint.getTextBounds(text, 0, text.length(), bounds);
-        int textHeight = bounds.bottom - bounds.top  - (int)paint.descent();
-        return height - ((height - textHeight) / 2);
+        int textHeight = bounds.bottom - bounds.top ;
+        return height - ((height - textHeight) / 2) - (int)paint.descent();
     }
 
-    private RecipientChip constructChipSpan(RecipientEntry contact, int offset, boolean pressed)
-            throws NullPointerException {
+    private RecipientChip constructChipSpan(RecipientEntry contact, int offset, boolean pressed,
+            boolean leaveIconSpace) throws NullPointerException {
         if (mChipBackground == null) {
             throw new NullPointerException(
                     "Unable to render any chips as setChipDimensions was not called.");
@@ -552,7 +675,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             tmpBitmap = createSelectedChip(contact, paint, layout);
 
         } else {
-            tmpBitmap = createUnselectedChip(contact, paint, layout);
+            tmpBitmap = createUnselectedChip(contact, paint, layout, leaveIconSpace);
         }
 
         // Pass the full text, un-ellipsized, to the chip.
@@ -587,36 +710,58 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         return getWidth() - getPaddingLeft() - getPaddingRight() - (mChipPadding * 2);
     }
 
-    /**
-     * Set all chip dimensions and resources. This has to be done from the
-     * application as this is a static library.
-     * @param chipBackground
-     * @param chipBackgroundPressed
-     * @param invalidChip
-     * @param chipDelete
-     * @param defaultContact
-     * @param moreResource
-     * @param alternatesLayout
-     * @param chipHeight
-     * @param padding Padding around the text in a chip
-     * @param chipFontSize
-     * @param copyViewRes
-     */
-    public void setChipDimensions(Drawable chipBackground, Drawable chipBackgroundPressed,
-            Drawable invalidChip, Drawable chipDelete, Bitmap defaultContact, int moreResource,
-            int alternatesLayout, float chipHeight, float padding,
-            float chipFontSize, int copyViewRes) {
-        mChipBackground = chipBackground;
-        mChipBackgroundPressed = chipBackgroundPressed;
-        mChipDelete = chipDelete;
-        mChipPadding = (int) padding;
-        mAlternatesLayout = alternatesLayout;
-        mDefaultContactPhoto = defaultContact;
-        mMoreItem = (TextView) LayoutInflater.from(getContext()).inflate(moreResource, null);
-        mChipHeight = chipHeight;
-        mChipFontSize = chipFontSize;
-        mInvalidChipBackground = invalidChip;
-        mCopyViewRes = copyViewRes;
+
+    private void setChipDimensions(Context context, AttributeSet attrs) {
+        TypedArray a = context.obtainStyledAttributes(attrs, R.styleable.RecipientEditTextView, 0,
+                0);
+        Resources r = getContext().getResources();
+        mChipBackground = a.getDrawable(R.styleable.RecipientEditTextView_chipBackground);
+        if (mChipBackground == null) {
+            mChipBackground = r.getDrawable(R.drawable.chip_background);
+        }
+        mChipBackgroundPressed = a
+                .getDrawable(R.styleable.RecipientEditTextView_chipBackgroundPressed);
+        if (mChipBackgroundPressed == null) {
+            mChipBackgroundPressed = r.getDrawable(R.drawable.chip_background_selected);
+        }
+        mChipDelete = a.getDrawable(R.styleable.RecipientEditTextView_chipDelete);
+        if (mChipDelete == null) {
+            mChipDelete = r.getDrawable(R.drawable.chip_delete);
+        }
+        mChipPadding = a.getDimensionPixelSize(R.styleable.RecipientEditTextView_chipPadding, -1);
+        if (mChipPadding == -1) {
+            mChipPadding = (int) r.getDimension(R.dimen.chip_padding);
+        }
+        mAlternatesLayout = a.getResourceId(R.styleable.RecipientEditTextView_chipAlternatesLayout,
+                -1);
+        if (mAlternatesLayout == -1) {
+            mAlternatesLayout = R.layout.chips_alternate_item;
+        }
+
+        mDefaultContactPhoto = BitmapFactory.decodeResource(r, R.drawable.ic_contact_picture);
+
+        mMoreItem = (TextView) LayoutInflater.from(getContext()).inflate(R.layout.more_item, null);
+
+        mChipHeight = a.getDimensionPixelSize(R.styleable.RecipientEditTextView_chipHeight, -1);
+        if (mChipHeight == -1) {
+            mChipHeight = r.getDimension(R.dimen.chip_height);
+        }
+        mChipFontSize = a.getDimensionPixelSize(R.styleable.RecipientEditTextView_chipFontSize, -1);
+        if (mChipFontSize == -1) {
+            mChipFontSize = r.getDimension(R.dimen.chip_text_size);
+        }
+        mInvalidChipBackground = a
+                .getDrawable(R.styleable.RecipientEditTextView_invalidChipBackground);
+        if (mInvalidChipBackground == null) {
+            mInvalidChipBackground = r.getDrawable(R.drawable.chip_background_invalid);
+        }
+        mLineSpacingExtra =  context.getResources().getDimension(R.dimen.line_spacing_extra);
+        TypedValue tv = new TypedValue();
+        if (context.getTheme().resolveAttribute(android.R.attr.actionBarSize, tv, true)) {
+            mActionBarHeight = TypedValue.complexToDimensionPixelSize(tv.data, getResources()
+                    .getDisplayMetrics());
+        }
+        a.recycle();
     }
 
     // Visible for testing.
@@ -735,7 +880,13 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                     mIndividualReplacements = new IndividualReplacementTask();
                     mIndividualReplacements.execute(new ArrayList<RecipientChip>(
                             mTemporaryRecipients.subList(0, CHIP_LIMIT)));
-
+                    if (mTemporaryRecipients.size() > CHIP_LIMIT) {
+                        mTemporaryRecipients = new ArrayList<RecipientChip>(
+                                mTemporaryRecipients.subList(CHIP_LIMIT,
+                                        mTemporaryRecipients.size()));
+                    } else {
+                        mTemporaryRecipients = null;
+                    }
                     createMoreChip();
                 }
             } else {
@@ -806,21 +957,25 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         RecipientEntry entry = createTokenizedEntry(token);
         if (entry != null) {
             String destText = createAddressText(entry);
-            // Always leave a blank space at the end of a chip.
-            int textLength = destText.length() - 1;
             SpannableString chipText = new SpannableString(destText);
             int end = getSelectionEnd();
-            int start = mTokenizer.findTokenStart(getText(), end);
+            int start = mTokenizer != null ? mTokenizer.findTokenStart(getText(), end) : 0;
             RecipientChip chip = null;
             try {
                 if (!mNoChips) {
-                    chip = constructChipSpan(entry, start, false);
-                    chipText.setSpan(chip, 0, textLength, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    /* leave space for the contact icon if this is not just an email address */
+                    chip = constructChipSpan(
+                            entry,
+                            start,
+                            false,
+                            TextUtils.isEmpty(entry.getDisplayName())
+                                    || TextUtils.equals(entry.getDisplayName(),
+                                            entry.getDestination()));
                 }
             } catch (NullPointerException e) {
                 Log.e(TAG, e.getMessage(), e);
             }
-            editable.replace(tokenStart, tokenEnd, chipText);
+            editable.setSpan(chip, tokenStart, tokenEnd, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
             // Add this chip to the list of entries "to replace"
             if (chip != null) {
                 if (mTemporaryRecipients == null) {
@@ -832,9 +987,25 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         }
     }
 
+    private static boolean isPhoneNumber(String number) {
+        // TODO: replace this function with libphonenumber's isPossibleNumber (see
+        // PhoneNumberUtil). One complication is that it requires the sender's region which
+        // comes from the CurrentCountryIso. For now, let's just do this simple match.
+        if (TextUtils.isEmpty(number)) {
+            return false;
+        }
+
+        Matcher match = PHONE_PATTERN.matcher(number);
+        return match.matches();
+    }
+
     private RecipientEntry createTokenizedEntry(String token) {
         if (TextUtils.isEmpty(token)) {
             return null;
+        }
+        if (isPhoneQuery() && isPhoneNumber(token)) {
+            return RecipientEntry
+                    .constructFakeEntry(token);
         }
         Rfc822Token[] tokens = Rfc822Tokenizer.tokenize(token);
         String display = null;
@@ -843,6 +1014,15 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             // this.
             display = tokens[0].getName();
             if (!TextUtils.isEmpty(display)) {
+                if (!isPhoneQuery()) {
+                    if (!TextUtils.isEmpty(token)) {
+                        token = token.trim();
+                    }
+                    char charAt = token.charAt(token.length() - 1);
+                    if (charAt == COMMIT_CHAR_COMMA || charAt == COMMIT_CHAR_SEMICOLON) {
+                        token = token.substring(0, token.length() - 1);
+                    }
+                }
                 return RecipientEntry.constructGeneratedEntry(display, token);
             } else {
                 display = tokens[0].getAddress();
@@ -917,8 +1097,9 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
      */
     @Override
     public boolean onKeyPreIme(int keyCode, KeyEvent event) {
-        if (keyCode == KeyEvent.KEYCODE_BACK) {
+        if (keyCode == KeyEvent.KEYCODE_BACK && mSelectedChip != null) {
             clearSelectedChip();
+            return true;
         }
         return super.onKeyPreIme(keyCode, event);
     }
@@ -959,6 +1140,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                         return true;
                     }
                 }
+                break;
         }
         return super.onKeyUp(keyCode, event);
     }
@@ -980,6 +1162,10 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
      * @return If a chip was created from a real contact.
      */
     private boolean commitDefault() {
+        // If there is no tokenizer, don't try to commit.
+        if (mTokenizer == null) {
+            return false;
+        }
         Editable editable = getText();
         int end = getSelectionEnd();
         int start = mTokenizer.findTokenStart(editable, end);
@@ -988,6 +1174,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             int whatEnd = mTokenizer.findTokenEnd(getText(), start);
             // In the middle of chip; treat this as an edit
             // and commit the whole token.
+            whatEnd = movePastTerminators(whatEnd);
             if (whatEnd != getSelectionEnd()) {
                 handleEdit(start, whatEnd);
                 return true;
@@ -998,6 +1185,10 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     }
 
     private void commitByCharacter() {
+        // We can't possibly commit by character if we can't tokenize.
+        if (mTokenizer == null) {
+            return;
+        }
         Editable editable = getText();
         int end = getSelectionEnd();
         int start = mTokenizer.findTokenStart(editable, end);
@@ -1010,7 +1201,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     private boolean commitChip(int start, int end, Editable editable) {
         ListAdapter adapter = getAdapter();
         if (adapter != null && adapter.getCount() > 0 && enoughToFilter()
-                && end == getSelectionEnd()) {
+                && end == getSelectionEnd() && !isPhoneQuery()) {
             // choose the first entry.
             submitItemAtPosition(0);
             dismissDropDown();
@@ -1075,7 +1266,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                     startLooking++;
                 }
             }
-            if (startLooking >= 0 && end >= 0 && startLooking != end) {
+            if (startLooking >= 0 && end >= 0 && startLooking < end) {
                 getText().delete(startLooking, end);
             }
         }
@@ -1161,7 +1352,8 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
      */
     @Override
     protected void performFiltering(CharSequence text, int keyCode) {
-        if (enoughToFilter() && !isCompletedToken(text)) {
+        boolean isCompletedToken = isCompletedToken(text);
+        if (enoughToFilter() && !isCompletedToken) {
             int end = getSelectionEnd();
             int start = mTokenizer.findTokenStart(text, end);
             // If this is a RecipientChip, don't filter
@@ -1171,6 +1363,8 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             if (chips != null && chips.length > 0) {
                 return;
             }
+        } else if (isCompletedToken) {
+            return;
         }
         super.performFiltering(text, keyCode);
     }
@@ -1239,8 +1433,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 }
                 chipWasSelected = true;
                 handled = true;
-            } else if (mSelectedChip != null
-                    && mSelectedChip.getContactId() == RecipientEntry.INVALID_CONTACT) {
+            } else if (mSelectedChip != null && shouldShowEditableText(mSelectedChip)) {
                 chipWasSelected = true;
             }
         }
@@ -1252,18 +1445,23 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
 
     private void scrollLineIntoView(int line) {
         if (mScrollView != null) {
-            mScrollView.scrollBy(0, calculateOffsetFromBottom(line));
+            mScrollView.smoothScrollBy(0, calculateOffsetFromBottom(line));
         }
     }
 
     private void showAlternates(RecipientChip currentChip, ListPopupWindow alternatesPopup,
             int width, Context context) {
         int line = getLayout().getLineForOffset(getChipStart(currentChip));
-        int bottom = calculateOffsetFromBottom(line);
+        int bottom;
+        if (line == getLineCount() -1) {
+            bottom = 0;
+        } else {
+            bottom = -(int) ((mChipHeight + (2 * mLineSpacingExtra)) * (Math.abs(getLineCount() - 1
+                    - line)));
+        }
         // Align the alternates popup with the left side of the View,
         // regardless of the position of the chip tapped.
         alternatesPopup.setWidth(width);
-        setEnabled(false);
         alternatesPopup.setAnchorView(this);
         alternatesPopup.setVerticalOffset(bottom);
         alternatesPopup.setAdapter(createAlternatesAdapter(currentChip));
@@ -1283,15 +1481,9 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         }
     }
 
-    // Dismiss listener for alterns and single address popup.
-    @Override
-    public void onDismiss() {
-        setEnabled(true);
-    }
-
     private ListAdapter createAlternatesAdapter(RecipientChip chip) {
         return new RecipientAlternatesAdapter(getContext(), chip.getContactId(), chip.getDataId(),
-                mAlternatesLayout, this);
+                mAlternatesLayout, ((BaseRecipientAdapter)getAdapter()).getQueryType(), this);
     }
 
     private ListAdapter createSingleAddressAdapter(RecipientChip currentChip) {
@@ -1361,24 +1553,30 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
 
     // Visible for testing.
     // Use this method to generate text to add to the list of addresses.
-    /*package*/ String createAddressText(RecipientEntry entry) {
+    /* package */String createAddressText(RecipientEntry entry) {
         String display = entry.getDisplayName();
         String address = entry.getDestination();
         if (TextUtils.isEmpty(display) || TextUtils.equals(display, address)) {
             display = null;
         }
-        if (address != null) {
-            // Tokenize out the address in case the address already
-            // contained the username as well.
-            Rfc822Token[] tokenized = Rfc822Tokenizer.tokenize(address);
-            if (tokenized != null && tokenized.length > 0) {
-                address = tokenized[0].getAddress();
+        String trimmedDisplayText;
+        if (isPhoneQuery() && isPhoneNumber(address)) {
+            trimmedDisplayText = address.trim();
+        } else {
+            if (address != null) {
+                // Tokenize out the address in case the address already
+                // contained the username as well.
+                Rfc822Token[] tokenized = Rfc822Tokenizer.tokenize(address);
+                if (tokenized != null && tokenized.length > 0) {
+                    address = tokenized[0].getAddress();
+                }
             }
+            Rfc822Token token = new Rfc822Token(display, address, null);
+            trimmedDisplayText = token.toString().trim();
         }
-        Rfc822Token token = new Rfc822Token(display, address, null);
-        String trimmedDisplayText = token.toString().trim();
         int index = trimmedDisplayText.indexOf(",");
-        return index < trimmedDisplayText.length() - 1 ? (String) mTokenizer
+        return mTokenizer != null && !TextUtils.isEmpty(trimmedDisplayText)
+                && index < trimmedDisplayText.length() - 1 ? (String) mTokenizer
                 .terminateToken(trimmedDisplayText) : trimmedDisplayText;
     }
 
@@ -1390,7 +1588,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         if (TextUtils.isEmpty(display) || TextUtils.equals(display, address)) {
             display = null;
         }
-        if (address != null) {
+        if (address != null && !(isPhoneQuery() && isPhoneNumber(address))) {
             // Tokenize out the address in case the address already
             // contained the username as well.
             Rfc822Token[] tokenized = Rfc822Tokenizer.tokenize(address);
@@ -1420,7 +1618,8 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         chipText = new SpannableString(displayText);
         if (!mNoChips) {
             try {
-                RecipientChip chip = constructChipSpan(entry, start, pressed);
+                RecipientChip chip = constructChipSpan(entry, start, pressed,
+                        false /* leave space for contact icon */);
                 chipText.setSpan(chip, 0, textLength,
                         Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                 chip.setOriginalText(chipText.toString());
@@ -1470,7 +1669,10 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         // valid contact, but the destination is invalid, then make this a fake
         // recipient that is editable.
         String destination = item.getDestination();
-        if (RecipientEntry.isCreatedRecipient(item.getContactId())
+        if (!isPhoneQuery() && item.getContactId() == RecipientEntry.GENERATED_CONTACT) {
+            entry = RecipientEntry.constructGeneratedEntry(item.getDisplayName(),
+                    destination);
+        } else if (RecipientEntry.isCreatedRecipient(item.getContactId())
                 && (TextUtils.isEmpty(item.getDisplayName())
                         || TextUtils.equals(item.getDisplayName(), destination)
                         || (mValidator != null && !mValidator.isValid(destination)))) {
@@ -1631,7 +1833,6 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         if (!mShouldShrink) {
             return;
         }
-
         ImageSpan[] tempMore = getSpannable().getSpans(0, getText().length(), MoreImageSpan.class);
         if (tempMore.length > 0) {
             getSpannable().removeSpan(tempMore[0]);
@@ -1674,6 +1875,10 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         chipText.setSpan(moreSpan, 0, chipText.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         text.replace(start, end, chipText);
         mMoreChip = moreSpan;
+        // If adding the +more chip goes over the limit, resize accordingly.
+        if (!isPhoneQuery() && getLineCount() > mMaxLines) {
+            setMaxLines(getLineCount());
+        }
     }
 
     /**
@@ -1733,14 +1938,20 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
      * just contained an email address.
      */
     private RecipientChip selectChip(RecipientChip currentChip) {
-        if (currentChip.getContactId() == RecipientEntry.INVALID_CONTACT) {
+        if (shouldShowEditableText(currentChip)) {
             CharSequence text = currentChip.getValue();
             Editable editable = getText();
-            removeChip(currentChip);
-            editable.append(text);
+            Spannable spannable = getSpannable();
+            int spanStart = spannable.getSpanStart(currentChip);
+            int spanEnd = spannable.getSpanEnd(currentChip);
+            spannable.removeSpan(currentChip);
+            editable.delete(spanStart, spanEnd);
             setCursorVisible(true);
             setSelection(editable.length());
-            return new RecipientChip(null, RecipientEntry.constructFakeEntry((String) text), -1);
+            editable.append(text);
+            return constructChipSpan(
+                    RecipientEntry.constructFakeEntry((String) text),
+                    getSelectionStart(), true, false);
         } else if (currentChip.getContactId() == RecipientEntry.GENERATED_CONTACT) {
             int start = getChipStart(currentChip);
             int end = getChipEnd(currentChip);
@@ -1750,7 +1961,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 if (mNoChips) {
                     return null;
                 }
-                newChip = constructChipSpan(currentChip.getEntry(), start, true);
+                newChip = constructChipSpan(currentChip.getEntry(), start, true, false);
             } catch (NullPointerException e) {
                 Log.e(TAG, e.getMessage(), e);
                 return null;
@@ -1763,7 +1974,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 editable.setSpan(newChip, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             }
             newChip.setSelected(true);
-            if (newChip.getEntry().getContactId() == RecipientEntry.INVALID_CONTACT) {
+            if (shouldShowEditableText(newChip)) {
                 scrollLineIntoView(getLayout().getLineForOffset(getChipStart(newChip)));
             }
             showAddress(newChip, mAddressPopup, getWidth(), getContext());
@@ -1775,7 +1986,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             getSpannable().removeSpan(currentChip);
             RecipientChip newChip;
             try {
-                newChip = constructChipSpan(currentChip.getEntry(), start, true);
+                newChip = constructChipSpan(currentChip.getEntry(), start, true, false);
             } catch (NullPointerException e) {
                 Log.e(TAG, e.getMessage(), e);
                 return null;
@@ -1788,7 +1999,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 editable.setSpan(newChip, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             }
             newChip.setSelected(true);
-            if (newChip.getEntry().getContactId() == RecipientEntry.INVALID_CONTACT) {
+            if (shouldShowEditableText(newChip)) {
                 scrollLineIntoView(getLayout().getLineForOffset(getChipStart(newChip)));
             }
             showAlternates(newChip, mAlternatesPopup, getWidth(), getContext());
@@ -1797,6 +2008,11 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         }
     }
 
+    private boolean shouldShowEditableText(RecipientChip currentChip) {
+        long contactId = currentChip.getContactId();
+        return contactId == RecipientEntry.INVALID_CONTACT
+                || (!isPhoneQuery() && contactId == RecipientEntry.GENERATED_CONTACT);
+    }
 
     private void showAddress(final RecipientChip currentChip, final ListPopupWindow popup,
             int width, Context context) {
@@ -1804,7 +2020,6 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
         int bottom = calculateOffsetFromBottom(line);
         // Align the alternates popup with the left side of the View,
         // regardless of the position of the chip tapped.
-        setEnabled(false);
         popup.setWidth(width);
         popup.setAnchorView(this);
         popup.setVerticalOffset(bottom);
@@ -1842,8 +2057,8 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             editable.removeSpan(chip);
             try {
                 if (!mNoChips) {
-                    editable.setSpan(constructChipSpan(chip.getEntry(), start, false), start, end,
-                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    editable.setSpan(constructChipSpan(chip.getEntry(), start, false, false),
+                            start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                 }
             } catch (NullPointerException e) {
                 Log.e(TAG, e.getMessage(), e);
@@ -1891,7 +2106,9 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             toDelete++;
         }
         spannable.removeSpan(chip);
-        text.delete(spanStart, toDelete);
+        if (spanStart >= 0 && toDelete > 0) {
+            text.delete(spanStart, toDelete);
+        }
         if (wasSelected) {
             clearSelectedChip();
         }
@@ -1919,8 +2136,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             } else {
                 if (!TextUtils.isEmpty(chipText)) {
                     // There may be a space to replace with this chip's new
-                    // associated
-                    // space. Check for it
+                    // associated space. Check for it
                     int toReplace = end;
                     while (toReplace >= 0 && toReplace < editable.length()
                             && editable.charAt(toReplace) == ' ') {
@@ -1962,6 +2178,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     }
 
     private class RecipientTextWatcher implements TextWatcher {
+
         @Override
         public void afterTextChanged(Editable s) {
             // If the text has been set to null or empty, make sure we remove
@@ -1986,7 +2203,7 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             }
             // If the user is editing a chip, don't clear it.
             if (mSelectedChip != null
-                    && mSelectedChip.getContactId() != RecipientEntry.INVALID_CONTACT) {
+                    && shouldShowEditableText(mSelectedChip)) {
                 setCursorVisible(true);
                 setSelection(getText().length());
                 clearSelectedChip();
@@ -2006,14 +2223,17 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 if (last == COMMIT_CHAR_SEMICOLON || last == COMMIT_CHAR_COMMA) {
                     commitByCharacter();
                 } else if (last == COMMIT_CHAR_SPACE) {
-                    // Check if this is a valid email address. If it is,
-                    // commit it.
-                    String text = getText().toString();
-                    int tokenStart = mTokenizer.findTokenStart(text, getSelectionEnd());
-                    String sub = text.substring(tokenStart, mTokenizer.findTokenEnd(text,
-                            tokenStart));
-                    if (!TextUtils.isEmpty(sub) && mValidator != null && mValidator.isValid(sub)) {
-                        commitByCharacter();
+                    if (!isPhoneQuery()) {
+                        // Check if this is a valid email address. If it is,
+                        // commit it.
+                        String text = getText().toString();
+                        int tokenStart = mTokenizer.findTokenStart(text, getSelectionEnd());
+                        String sub = text.substring(tokenStart, mTokenizer.findTokenEnd(text,
+                                tokenStart));
+                        if (!TextUtils.isEmpty(sub) && mValidator != null &&
+                                mValidator.isValid(sub)) {
+                            commitByCharacter();
+                        }
                     }
                 }
             }
@@ -2021,7 +2241,28 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
 
         @Override
         public void onTextChanged(CharSequence s, int start, int before, int count) {
-            // Do nothing.
+            // This is a delete; check to see if the insertion point is on a space
+            // following a chip.
+            if (before - count == 1) {
+                // If the item deleted is a space, and the thing before the
+                // space is a chip, delete the entire span.
+                int selStart = getSelectionStart();
+                RecipientChip[] repl = getSpannable().getSpans(selStart, selStart,
+                        RecipientChip.class);
+                if (repl.length > 0) {
+                    // There is a chip there! Just remove it.
+                    Editable editable = getText();
+                    // Add the separator token.
+                    int tokenStart = mTokenizer.findTokenStart(editable, selStart);
+                    int tokenEnd = mTokenizer.findTokenEnd(editable, tokenStart);
+                    tokenEnd = tokenEnd + 1;
+                    if (tokenEnd > editable.length()) {
+                        tokenEnd = editable.length();
+                    }
+                    editable.delete(tokenStart, tokenEnd);
+                    getSpannable().removeSpan(repl[0]);
+                }
+            }
         }
 
         @Override
@@ -2099,9 +2340,13 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 int tokenEnd;
                 RecipientChip createdChip;
                 while (tokenStart < originalTokenStart) {
-                    tokenEnd = movePastTerminators(mTokenizer.findTokenEnd(text, tokenStart));
+                    tokenEnd = movePastTerminators(mTokenizer.findTokenEnd(getText().toString(),
+                            tokenStart));
                     commitChip(tokenStart, tokenEnd, getText());
                     createdChip = findChip(tokenStart);
+                    if (createdChip == null) {
+                        break;
+                    }
                     // +1 for the space at the end.
                     tokenStart = getSpannable().getSpanEnd(createdChip) + 1;
                     created.add(createdChip);
@@ -2142,7 +2387,8 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 if (mNoChips) {
                     return null;
                 }
-                return constructChipSpan(entry, -1, false);
+                return constructChipSpan(entry, -1, false,
+                        false /*leave space for contact icon */);
             } catch (NullPointerException e) {
                 Log.e(TAG, e.getMessage(), e);
                 return null;
@@ -2165,9 +2411,13 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             if (mRemovedSpans != null) {
                 originalRecipients.addAll(mRemovedSpans);
             }
-            String[] addresses = new String[originalRecipients.size()];
+            ArrayList<String> addresses = new ArrayList<String>();
+            RecipientChip chip;
             for (int i = 0; i < originalRecipients.size(); i++) {
-                addresses[i] = createAddressText(originalRecipients.get(i).getEntry());
+                chip = originalRecipients.get(i);
+                if (chip != null) {
+                    addresses.add(createAddressText(chip.getEntry()));
+                }
             }
             HashMap<String, RecipientEntry> entries = RecipientAlternatesAdapter
                     .getMatchingRecipients(getContext(), addresses);
@@ -2190,26 +2440,30 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 mHandler.post(new Runnable() {
                     @Override
                     public void run() {
-                        SpannableStringBuilder text = new SpannableStringBuilder(getText()
-                                .toString());
                         Editable oldText = getText();
                         int start, end;
                         int i = 0;
                         for (RecipientChip chip : originalRecipients) {
+                            // Find the location of the chip in the text currently shown.
                             start = oldText.getSpanStart(chip);
                             if (start != -1) {
                                 end = oldText.getSpanEnd(chip);
                                 oldText.removeSpan(chip);
-                                // Leave a spot for the space!
                                 RecipientChip replacement = replacements.get(i);
-                                text.setSpan(replacement, start, end,
+                                // Make sure we always have just 1 space at the
+                                // end to separate this chip from the next chip.
+                                SpannableString displayText = new SpannableString(
+                                        createAddressText(replacement.getEntry()).trim() + " ");
+                                displayText.setSpan(replacement, 0, displayText.length()-1,
                                         Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                                replacement.setOriginalText(text.toString().substring(start, end));
+                                // Replace the old text we found with with the new display text,
+                                // which now may also contain the display name of the recipient.
+                                oldText.replace(start, end, displayText);
+                                replacement.setOriginalText(displayText.toString());
                             }
                             i++;
                         }
                         originalRecipients.clear();
-                        setText(text);
                     }
                 });
             }
@@ -2225,10 +2479,14 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
             // If there is a match, replace that chip with the matching
             // chip.
             final ArrayList<RecipientChip> originalRecipients =
-                (ArrayList<RecipientChip>) params[0];
-            String[] addresses = new String[originalRecipients.size()];
+                    (ArrayList<RecipientChip>) params[0];
+            ArrayList<String> addresses = new ArrayList<String>();
+            RecipientChip chip;
             for (int i = 0; i < originalRecipients.size(); i++) {
-                addresses[i] = createAddressText(originalRecipients.get(i).getEntry());
+                chip = originalRecipients.get(i);
+                if (chip != null) {
+                    addresses.add(createAddressText(chip.getEntry()));
+                }
             }
             HashMap<String, RecipientEntry> entries = RecipientAlternatesAdapter
                     .getMatchingRecipients(getContext(), addresses);
@@ -2236,13 +2494,19 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 if (RecipientEntry.isCreatedRecipient(temp.getEntry().getContactId())
                         && getSpannable().getSpanStart(temp) != -1) {
                     // Replace this.
-                    final RecipientEntry entry = createValidatedEntry(entries
-                            .get(tokenizeAddress(temp.getEntry().getDestination()).toLowerCase()));
-                    if (entry != null) {
+                    RecipientEntry entry = createValidatedEntry(entries.get(tokenizeAddress(
+                            temp.getEntry().getDestination()).toLowerCase()));
+                    // If we don't have a validated contact match, just use the
+                    // entry as it existed before.
+                    if (entry == null && !isPhoneQuery()) {
+                        entry = temp.getEntry();
+                    }
+                    final RecipientEntry tempEntry = entry;
+                    if (tempEntry != null) {
                         mHandler.post(new Runnable() {
                             @Override
                             public void run() {
-                                replaceChip(temp, entry);
+                                replaceChip(temp, tempEntry);
                             }
                         });
                     }
@@ -2361,10 +2625,19 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
     private void showCopyDialog(final String address) {
         mCopyAddress = address;
         mCopyDialog.setTitle(address);
-        mCopyDialog.setContentView(mCopyViewRes);
+        mCopyDialog.setContentView(R.layout.copy_chip_dialog_layout);
         mCopyDialog.setCancelable(true);
         mCopyDialog.setCanceledOnTouchOutside(true);
-        mCopyDialog.findViewById(android.R.id.button1).setOnClickListener(this);
+        Button button = (Button)mCopyDialog.findViewById(android.R.id.button1);
+        button.setOnClickListener(this);
+        int btnTitleId;
+        if (isPhoneQuery()) {
+            btnTitleId = R.string.copy_number;
+        } else {
+            btnTitleId = R.string.copy_email;
+        }
+        String buttonTitle = getContext().getResources().getString(btnTitleId);
+        button.setText(buttonTitle);
         mCopyDialog.setOnDismissListener(this);
         mCopyDialog.show();
     }
@@ -2398,5 +2671,11 @@ public class RecipientEditTextView extends MultiAutoCompleteTextView implements
                 Context.CLIPBOARD_SERVICE);
         clipboard.setPrimaryClip(ClipData.newPlainText("", mCopyAddress));
         mCopyDialog.dismiss();
+    }
+
+    protected boolean isPhoneQuery() {
+        return getAdapter() != null
+                && ((BaseRecipientAdapter) getAdapter()).getQueryType()
+                    == BaseRecipientAdapter.QUERY_TYPE_PHONE;
     }
 }

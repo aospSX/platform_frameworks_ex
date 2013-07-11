@@ -15,12 +15,15 @@
 -->
 <resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
     <!-- Text displayed when the recipientedittextview is not focused. Displays the total number of recipients since the field is shrunk to just display a portion -->
-    <string name="more_string"><xliff:g id="count">%1$s</xliff:g> more...</string>
+    <string name="more_string">\u002B<xliff:g id="count">%1$s</xliff:g></string>
 
-    <!-- Text displayed when there are remote directories not returning results.
-         [CHAR LIMIT=50] -->
-    <string name="chips_waiting_for_directory_result">Waiting for more contacts</string>
     <!-- Text displayed when the user long presses on a chip to copy the recipients email address.
          [CHAR LIMIT=200] -->
-    <string name="copy">Copy email address</string>
+    <string name="copy_email">Copy email address</string>
+    <!-- Text displayed when the user long presses on a chip to copy the recipient's phone number.
+         [CHAR LIMIT=200] -->
+    <string name="copy_number">Copy phone number</string>
+    <!-- Text displayed in the enter key slot when the recipientedittextview has focus.
+         [CHAR LIMIT=12] -->
+    <string name="done">Return</string>
 </resources>
